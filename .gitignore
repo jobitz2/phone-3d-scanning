@@ -4,3 +4,7 @@ __pycache__/
 .DS_Store
 # scans, frames, and COLMAP outputs are large: keep them out of git
 data/
+xcuserdata/
+DerivedData/
+*.xcuserstate
+build/
