@@ -13,7 +13,11 @@ enum MeshExporter {
 
         var obj = "# ObjectScan export. Units: metres. Y is up (ARKit world space).\n"
         for (i, m) in measurements.enumerated() {
-            obj += String(format: "# measurement %d: %.4f m\n", i + 1, m.meters)
+            if let s = m.box?.size {
+                obj += String(format: "# measurement %d (box): %.4f x %.4f x %.4f m (L x W x H)\n", i + 1, s.x, s.z, s.y)
+            } else {
+                obj += String(format: "# measurement %d: %.4f m\n", i + 1, m.meters)
+            }
         }
 
         var vertexOffset = 0

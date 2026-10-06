@@ -79,7 +79,7 @@ struct ContentView: View {
                 ForEach(MeasureMode.allCases) { Text($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented)
-            .frame(width: 220)
+            .frame(width: 270)
 
             HStack(spacing: 28) {
                 CircleButton(systemName: "arrow.uturn.backward") { scan.undo() }
@@ -117,6 +117,7 @@ struct ContentView: View {
     private var instruction: String {
         switch scan.mode {
         case .height: return "Aim at the top of the object, just inside the edge, then tap +"
+        case .box: return "Scan all the way around the object, aim at it, then tap +"
         case .distance: return scan.hasPendingStart ? "Aim at the other end" : "Aim the dot at one end of the object, then tap +"
         }
     }

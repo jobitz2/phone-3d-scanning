@@ -86,6 +86,10 @@ final class ScanController: NSObject, ObservableObject {
     /// First tap sets the start point at the reticle; second tap finishes the measurement.
     func addPoint() {
         guard let point = reticleWorld else { return }
+        if mode == .box {
+            measureBox(at: point)
+            return
+        }
         if mode == .height {
             guard let foot = supportPoint(below: point) else {
                 showHint("Scan the table or floor around the object first")
@@ -160,12 +164,16 @@ final class ScanController: NSObject, ObservableObject {
         // Distance mode previews from the first point; Height mode previews straight down to the support surface.
         let previewStart: SIMD3<Float>?
         let previewEnd: SIMD3<Float>?
-        if mode == .height {
+        switch mode {
+        case .height:
             previewStart = hit
             previewEnd = supportPoint(below: hit)
-        } else {
+        case .distance:
             previewStart = pendingStart
             previewEnd = pendingStart == nil ? nil : hit
+        case .box:
+            previewStart = nil
+            previewEnd = nil
         }
         if let a = previewStart, let b = previewEnd {
             Self.stretch(previewLine, from: a, to: b)
@@ -228,6 +236,91 @@ final class ScanController: NSObject, ObservableObject {
         return nil
     }
 
+    // MARK: Box mode
+    /// Gathers scanned points above the support surface near `point`, keeps the ones connected to it,
+    /// and fits an upright box. Points come from the accumulated LiDAR mesh (every side you've scanned)
+    /// plus the current depth frame (denser, so small objects get enough points).
+    private func measureBox(at point: SIMD3<Float>) {
+        guard let floor = supportPoint(below: point) else {
+            showHint("Scan the table or floor around the object first")
+            return
+        }
+        let floorY = floor.y
+        let keep: (SIMD3<Float>) -> Bool = { p in
+            let dx = p.x - point.x, dz = p.z - point.z
+            return p.y > floorY + 0.012 && p.y < floorY + 2.5 && dx * dx + dz * dz < 2.25 // within 1.5 m
+        }
+        let candidates = meshPoints(where: keep) + depthFramePoints(where: keep)
+        guard let box = ObjectBoxFitter.fit(points: candidates, seed: point, floorY: floorY) else {
+            showHint("Couldn't find an object there. Scan around it, then try again")
+            return
+        }
+        guard box.size.x < 3 else {
+            showHint("That's bigger than an object. Is it touching a wall?")
+            return
+        }
+        let m = Measurement(start: box.center, end: box.center, kind: .box, box: box)
+        measurements.append(m)
+        place(m)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    }
+
+    private func meshPoints(where keep: (SIMD3<Float>) -> Bool) -> [SIMD3<Float>] {
+        let anchors = arView.session.currentFrame?.anchors.compactMap { $0 as? ARMeshAnchor } ?? []
+        var out: [SIMD3<Float>] = []
+        for anchor in anchors {
+            let vertices = anchor.geometry.vertices
+            let base = vertices.buffer.contents().advanced(by: vertices.offset)
+            for i in 0..<vertices.count {
+                let v = base.advanced(by: i * vertices.stride).assumingMemoryBound(to: Float.self)
+                let w = anchor.transform * SIMD4<Float>(v[0], v[1], v[2], 1)
+                let p = SIMD3(w.x, w.y, w.z)
+                if keep(p) { out.append(p) }
+            }
+        }
+        return out
+    }
+
+    /// High-confidence pixels of the current depth map as world points (every other pixel).
+    private func depthFramePoints(where keep: (SIMD3<Float>) -> Bool) -> [SIMD3<Float>] {
+        guard let frame = arView.session.currentFrame,
+              let depth = frame.smoothedSceneDepth ?? frame.sceneDepth,
+              let confidence = depth.confidenceMap else { return [] }
+        let map = depth.depthMap
+        let width = CVPixelBufferGetWidth(map), height = CVPixelBufferGetHeight(map)
+
+        // Intrinsics are for the full-resolution camera image; scale them to the depth map.
+        let imageSize = frame.camera.imageResolution
+        let sx = Float(width) / Float(imageSize.width), sy = Float(height) / Float(imageSize.height)
+        var K = frame.camera.intrinsics
+        K[0][0] *= sx; K[2][0] *= sx
+        K[1][1] *= sy; K[2][1] *= sy
+
+        CVPixelBufferLockBaseAddress(map, .readOnly)
+        CVPixelBufferLockBaseAddress(confidence, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(map, .readOnly)
+            CVPixelBufferUnlockBaseAddress(confidence, .readOnly)
+        }
+        guard let depthBase = CVPixelBufferGetBaseAddress(map),
+              let confBase = CVPixelBufferGetBaseAddress(confidence) else { return [] }
+        let depthRow = CVPixelBufferGetBytesPerRow(map), confRow = CVPixelBufferGetBytesPerRow(confidence)
+        let high = UInt8(ARConfidenceLevel.high.rawValue)
+
+        var out: [SIMD3<Float>] = []
+        for v in stride(from: 0, to: height, by: 2) {
+            for u in stride(from: 0, to: width, by: 2) {
+                guard confBase.load(fromByteOffset: v * confRow + u, as: UInt8.self) == high else { continue }
+                let z = depthBase.load(fromByteOffset: v * depthRow + u * 4, as: Float32.self)
+                guard z.isFinite, z > 0.05 else { continue }
+                let p = ObjectBoxFitter.unproject(pixel: SIMD2(Float(u), Float(v)), depth: z,
+                                                  intrinsics: K, cameraToWorld: frame.camera.transform)
+                if keep(p) { out.append(p) }
+            }
+        }
+        return out
+    }
+
     private func showHint(_ text: String) {
         hint = text
         Task { [weak self] in
@@ -260,6 +353,10 @@ final class ScanController: NSObject, ObservableObject {
 
     // MARK: Scene building
     private func place(_ m: Measurement) {
+        if let box = m.box {
+            placeBox(box, for: m)
+            return
+        }
         let anchor = AnchorEntity(world: .zero)
         let a = Self.makeMarker(); a.position = m.start
         let b = Self.makeMarker(); b.position = m.end
@@ -276,12 +373,48 @@ final class ScanController: NSObject, ObservableObject {
         labelEntities[m.id] = label
     }
 
+    /// A yellow wireframe box (12 thin bars) with the dimensions floating above it.
+    private func placeBox(_ box: FittedBox, for m: Measurement) {
+        let anchor = AnchorEntity(world: box.center)
+        let frame = Entity()
+        frame.orientation = box.orientation
+        let h = box.size / 2
+        let t: Float = 0.002
+        let material = UnlitMaterial(color: .systemYellow)
+        func bar(_ size: SIMD3<Float>, at position: SIMD3<Float>) {
+            let e = ModelEntity(mesh: .generateBox(size: size), materials: [material])
+            e.position = position
+            frame.addChild(e)
+        }
+        for a: Float in [-1, 1] {
+            for b: Float in [-1, 1] {
+                bar([box.size.x, t, t], at: [0, a * h.y, b * h.z]) // along length
+                bar([t, box.size.y, t], at: [a * h.x, 0, b * h.z]) // vertical
+                bar([t, t, box.size.z], at: [a * h.x, b * h.y, 0]) // along width
+            }
+        }
+        anchor.addChild(frame)
+        arView.scene.addAnchor(anchor)
+
+        let label = makeLabel(for: m)
+        anchor.addChild(label) // makeLabel uses world coordinates; the anchor sits at the box centre
+        label.setPosition(labelPosition(for: m), relativeTo: nil)
+        measurementAnchors[m.id] = anchor
+        labelEntities[m.id] = label
+    }
+
+    private func labelPosition(for m: Measurement) -> SIMD3<Float> {
+        if let box = m.box { return box.center + SIMD3(0, box.size.y / 2 + 0.03, 0) }
+        return m.midpoint + SIMD3(0, 0.025, 0)
+    }
+
     private func relabelMeasurements() {
         for m in measurements {
             guard let anchor = measurementAnchors[m.id] else { continue }
             labelEntities[m.id]?.removeFromParent()
             let label = makeLabel(for: m)
             anchor.addChild(label)
+            label.setPosition(labelPosition(for: m), relativeTo: nil)
             labelEntities[m.id] = label
         }
     }
@@ -296,7 +429,7 @@ final class ScanController: NSObject, ObservableObject {
 
         let pivot = Entity()
         pivot.addChild(text)
-        let position = m.midpoint + SIMD3(0, 0.025, 0)
+        let position = labelPosition(for: m)
         let camera = arView.cameraTransform.translation
         pivot.look(at: camera, from: position, relativeTo: nil)
         pivot.orientation *= simd_quatf(angle: .pi, axis: [0, 1, 0]) // text faces +Z; look(at:) aims -Z
