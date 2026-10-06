@@ -1,0 +1,16 @@
+[project]
+name = "phone-3d-scanning"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jupyterlab>=4.6.4",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.3",
+    "open3d>=0.20.0",
+    "opencv-python>=5.0.0.93",
+    "pycolmap==4.2.1",
+    "scipy>=1.18.1",
+    "trimesh>=5.1.1",
+]

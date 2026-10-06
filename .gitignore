@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+# scans, frames, and COLMAP outputs are large: keep them out of git
+data/
