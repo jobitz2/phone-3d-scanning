@@ -55,8 +55,13 @@ struct ContentView: View {
 
     private var bottomPanel: some View {
         VStack(spacing: 12) {
-            if let d = scan.liveDistance {
-                Text(scan.unit.format(d))
+            if let hint = scan.hint {
+                Text(hint)
+                    .font(.footnote.weight(.medium))
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(Color.orange.opacity(0.85), in: Capsule())
+            } else if let d = scan.liveDistance {
+                Text((scan.mode == .height ? "H " : "") + scan.unit.format(d))
                     .font(.system(size: 34, weight: .bold, design: .rounded))
                     .monospacedDigit()
                     .padding(.horizontal, 16).padding(.vertical, 6)
@@ -64,11 +69,17 @@ struct ContentView: View {
             } else if !scan.measurements.isEmpty {
                 measurementList
             } else {
-                Text(scan.hasPendingStart ? "Aim at the other end" : "Aim the dot at one end of the object, then tap +")
+                Text(instruction)
                     .font(.footnote)
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(.ultraThinMaterial, in: Capsule())
             }
+
+            Picker("Mode", selection: $scan.mode) {
+                ForEach(MeasureMode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 220)
 
             HStack(spacing: 28) {
                 CircleButton(systemName: "arrow.uturn.backward") { scan.undo() }
@@ -103,12 +114,19 @@ struct ContentView: View {
         }
     }
 
+    private var instruction: String {
+        switch scan.mode {
+        case .height: return "Aim at the top of the object, just inside the edge, then tap +"
+        case .distance: return scan.hasPendingStart ? "Aim at the other end" : "Aim the dot at one end of the object, then tap +"
+        }
+    }
+
     private var measurementList: some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(scan.measurements.enumerated().suffix(3)), id: \.element.id) { index, m in
                 HStack {
                     Text("#\(index + 1)").foregroundStyle(.secondary)
-                    Text(scan.unit.format(m.meters)).monospacedDigit().bold()
+                    Text(m.label(in: scan.unit)).monospacedDigit().bold()
                 }
             }
         }

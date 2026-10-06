@@ -10,6 +10,8 @@ final class ScanController: NSObject, ObservableObject {
     let isSupported = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
     @Published var showMesh = true { didSet { applyMeshVisibility() } }
     @Published var unit: LengthUnit = .cm { didSet { relabelMeasurements() } }
+    @Published var mode: MeasureMode = .distance { didSet { cancelPending() } }
+    @Published private(set) var hint: String?
     @Published private(set) var measurements: [Measurement] = []
     @Published private(set) var hasPendingStart = false
     @Published private(set) var liveDistance: Float?
@@ -53,8 +55,12 @@ final class ScanController: NSObject, ObservableObject {
         let config = ARWorldTrackingConfiguration()
         config.sceneReconstruction = .mesh
         config.environmentTexturing = .none
+        config.planeDetection = [.horizontal] // the table or floor that Height mode measures down to
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             config.frameSemantics.insert(.sceneDepth)
+        }
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+            config.frameSemantics.insert(.smoothedSceneDepth)
         }
         arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
         applyMeshVisibility()
@@ -80,6 +86,17 @@ final class ScanController: NSObject, ObservableObject {
     /// First tap sets the start point at the reticle; second tap finishes the measurement.
     func addPoint() {
         guard let point = reticleWorld else { return }
+        if mode == .height {
+            guard let foot = supportPoint(below: point) else {
+                showHint("Scan the table or floor around the object first")
+                return
+            }
+            let m = Measurement(start: point, end: foot, kind: .height)
+            measurements.append(m)
+            place(m)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            return
+        }
         if let start = pendingStart {
             let m = Measurement(start: start, end: point)
             measurements.append(m)
@@ -127,7 +144,7 @@ final class ScanController: NSObject, ObservableObject {
     // MARK: Per-frame reticle
     private func updateReticle() {
         let center = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
-        guard let hit = surfacePoint(at: center) else {
+        guard let hit = centerDepthPoint() ?? surfacePoint(at: center) else {
             reticle.isEnabled = false
             previewLine.isEnabled = false
             reticleWorld = nil
@@ -140,12 +157,82 @@ final class ScanController: NSObject, ObservableObject {
         reticleWorld = hit
         if !reticleOnSurface { reticleOnSurface = true }
 
-        if let start = pendingStart {
-            Self.stretch(previewLine, from: start, to: hit)
+        // Distance mode previews from the first point; Height mode previews straight down to the support surface.
+        let previewStart: SIMD3<Float>?
+        let previewEnd: SIMD3<Float>?
+        if mode == .height {
+            previewStart = hit
+            previewEnd = supportPoint(below: hit)
+        } else {
+            previewStart = pendingStart
+            previewEnd = pendingStart == nil ? nil : hit
+        }
+        if let a = previewStart, let b = previewEnd {
+            Self.stretch(previewLine, from: a, to: b)
             previewLine.isEnabled = true
-            let d = simd_distance(start, hit)
+            let d = simd_distance(a, b)
             // Only publish millimetre-level changes so SwiftUI isn't redrawn on every frame.
             if liveDistance.map({ abs($0 - d) > 0.0005 }) ?? true { liveDistance = d }
+        } else {
+            previewLine.isEnabled = false
+            if liveDistance != nil { liveDistance = nil }
+        }
+    }
+
+    /// The point under the screen centre from this frame's LiDAR depth map, or nil when
+    /// confidence isn't high. Sharper at object edges than the reconstructed mesh, which
+    /// rounds corners off by about a centimetre. Uses the map's centre pixel: the camera
+    /// image is aspect-filled into the view, so the view centre is the image centre.
+    private func centerDepthPoint() -> SIMD3<Float>? {
+        guard let frame = arView.session.currentFrame,
+              let depth = frame.smoothedSceneDepth ?? frame.sceneDepth,
+              let confidence = depth.confidenceMap,
+              let ray = arView.ray(through: CGPoint(x: arView.bounds.midX, y: arView.bounds.midY))
+        else { return nil }
+
+        let map = depth.depthMap
+        let x = CVPixelBufferGetWidth(map) / 2
+        let y = CVPixelBufferGetHeight(map) / 2
+
+        CVPixelBufferLockBaseAddress(confidence, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(confidence, .readOnly) }
+        guard let confBase = CVPixelBufferGetBaseAddress(confidence) else { return nil }
+        let level = confBase.load(fromByteOffset: y * CVPixelBufferGetBytesPerRow(confidence) + x, as: UInt8.self)
+        guard level == UInt8(ARConfidenceLevel.high.rawValue) else { return nil }
+
+        CVPixelBufferLockBaseAddress(map, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
+        guard let depthBase = CVPixelBufferGetBaseAddress(map) else { return nil }
+        let z = depthBase.load(fromByteOffset: y * CVPixelBufferGetBytesPerRow(map) + x * 4, as: Float32.self)
+        guard z.isFinite, z > 0.05 else { return nil }
+
+        // Depth is distance along the camera's viewing axis (-Z), not along the ray.
+        let c = frame.camera.transform.columns.2
+        let forward = -SIMD3<Float>(c.x, c.y, c.z)
+        let direction = simd_normalize(ray.direction)
+        let cosAngle = simd_dot(direction, forward)
+        guard cosAngle > 0.1 else { return nil }
+        return ray.origin + direction * (z / cosAngle)
+    }
+
+    /// The point on the horizontal surface directly below `point` (the table or floor the object
+    /// stands on). Starts 2 cm below the point so a plane detected on the object's own top is skipped.
+    private func supportPoint(below point: SIMD3<Float>) -> SIMD3<Float>? {
+        let origin = point - SIMD3<Float>(0, 0.02, 0)
+        for target in [ARRaycastQuery.Target.existingPlaneGeometry, .existingPlaneInfinite] {
+            let query = ARRaycastQuery(origin: origin, direction: [0, -1, 0], allowing: target, alignment: .horizontal)
+            if let result = arView.session.raycast(query).first {
+                return SIMD3(point.x, result.worldTransform.columns.3.y, point.z)
+            }
+        }
+        return nil
+    }
+
+    private func showHint(_ text: String) {
+        hint = text
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            if self?.hint == text { self?.hint = nil }
         }
     }
 
@@ -202,7 +289,7 @@ final class ScanController: NSObject, ObservableObject {
     /// A text label floating just above the midpoint, turned to face the camera.
     private func makeLabel(for m: Measurement) -> Entity {
         let mesh = MeshResource.generateText(
-            unit.format(m.meters), extrusionDepth: 0.0005,
+            m.label(in: unit), extrusionDepth: 0.0005,
             font: .systemFont(ofSize: 0.025, weight: .semibold))
         let text = ModelEntity(mesh: mesh, materials: [UnlitMaterial(color: .white)])
         text.position = -mesh.bounds.center // centre the glyphs on the pivot
